@@ -22,7 +22,7 @@ With Homebrew:
 ```sh
 brew tap hrubymar10/tap
 brew trust hrubymar10/tap
-brew install --HEAD aws-ai-proxy
+brew install hrubymar10/tap/aws-ai-proxy
 ```
 
 During development, use the wrapper:
@@ -42,11 +42,14 @@ export AWS_AI_PROXY_PROFILES=my-readonly,my-test-readonly
 export AWS_AI_PROXY_BIND=127.0.0.1:9998
 export AWS_AI_PROXY_ALLOW=127.0.0.0/8,::1/128
 export AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true
+export AWS_AI_PROXY_AWS_CLI_BINARY_PATH=/opt/homebrew/bin/aws
+export AWS_AI_PROXY_AWS_CONFIG_PATH=$HOME/.aws/config
 ```
 
 Configuration keys:
 
-- `AWS_AI_PROXY_PROFILES` - required comma-separated profile names.
+- `AWS_AI_PROXY_PROFILES` - required comma-separated profile names. Entries may
+  use `profile:region` to set an explicit `/profiles` region for that profile.
 - `AWS_AI_PROXY_BIND` - bind address, default `127.0.0.1:9998`. The host must
   be an IP literal. Use `0.0.0.0:9998` or `[::]:9998` only with a tight
   allowlist.
@@ -56,6 +59,16 @@ Configuration keys:
 - `AWS_AI_PROXY_ACCESS_LOGS_ENABLED` - access logging to
   `~/.aws-ai-proxy/access.log`, default `true`. Set to `false`, `0`, `no`, or
   `off` to disable.
+- `AWS_AI_PROXY_AWS_CLI_BINARY_PATH` - optional absolute path to the `aws` CLI
+  binary. When unset, `aws-ai-proxy` uses `PATH`, then common install paths:
+  `/opt/homebrew/bin/aws`, `/usr/local/bin/aws`, and `/usr/bin/aws`. A leading
+  `~` is expanded to your home directory.
+- `AWS_AI_PROXY_AWS_CONFIG_PATH` - optional path passed to `aws` subprocesses as
+  `AWS_CONFIG_FILE`. Set this when a launcher such as `brew services` has a
+  different `HOME` than your interactive shell. This may point at the config
+  file, such as `~/.aws/config`, or the `.aws` directory; when it points at an
+  existing directory, `aws-ai-proxy` appends `config`. A leading `~` is expanded
+  to your home directory.
 
 If an environment variable is unset, `aws-ai-proxy` falls back to
 `~/.aws-ai-proxy/config`. This file uses `KEY=VALUE` lines with the same names
@@ -66,6 +79,8 @@ AWS_AI_PROXY_BIND=127.0.0.1:9998
 AWS_AI_PROXY_ALLOW=127.0.0.0/8,::1/128
 AWS_AI_PROXY_PROFILES=my-readonly,my-test-readonly
 AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true
+AWS_AI_PROXY_AWS_CLI_BINARY_PATH=
+AWS_AI_PROXY_AWS_CONFIG_PATH=
 ```
 
 Environment variables win per field. On startup, `aws-ai-proxy` creates
@@ -76,9 +91,11 @@ never rewritten.
 
 Access log lines contain UTC timestamp, client IP, method, path, and response
 status. Response bodies and credentials are never logged.
+Runtime warnings and errors are also written to `~/.aws-ai-proxy/error.log`.
 
-The Homebrew service does not read your interactive shell profile, so use
-`~/.aws-ai-proxy/config` when running the proxy through `brew services`.
+The Homebrew service does not read your interactive shell profile and may have
+a minimal `PATH`, so use `~/.aws-ai-proxy/config` for required values and set
+`AWS_AI_PROXY_AWS_CLI_BINARY_PATH` if the service cannot find `aws`.
 
 The host must have an active session for each profile, for example:
 
@@ -94,7 +111,13 @@ Show help:
 aws-ai-proxy
 ```
 
-Run the server:
+Run the server (recommended; runs in the background and restarts on login):
+
+```sh
+brew services start aws-ai-proxy
+```
+
+Or run it in the foreground for development or non-Homebrew installs:
 
 ```sh
 aws-ai-proxy serve
@@ -117,12 +140,6 @@ AWS_AI_PROXY_ENABLED=1 AWS_AI_PROXY_URL=http://host.docker.internal:9998 \
   ../codex-docker/bin/codex-docker-ctrl start
 ```
 
-With Homebrew:
-
-```sh
-brew services start aws-ai-proxy
-```
-
 ## Endpoints
 
 - `GET /health`
@@ -136,14 +153,20 @@ brew services start aws-ai-proxy
 [{"name":"my-readonly","region":"us-east-1"}]
 ```
 
+Region precedence is `profile:region` from `AWS_AI_PROXY_PROFILES`, then
+`aws configure get region --profile <profile>`, then an empty string.
+
 `/credentials/{profile}` shells out on the host:
 
 ```sh
 aws configure export-credentials --profile <profile>
 ```
 
-The command inherits the launcher environment, including `AWS_CONFIG_FILE` and
-`AWS_SHARED_CREDENTIALS_FILE` when those are set.
+The proxy resolves the `aws` binary from `AWS_AI_PROXY_AWS_CLI_BINARY_PATH`,
+then `PATH`, then common install paths. When `AWS_AI_PROXY_AWS_CONFIG_PATH` is
+set, the proxy passes it to this command as `AWS_CONFIG_FILE`. The command also
+inherits the launcher environment, including `AWS_SHARED_CREDENTIALS_FILE` when
+set.
 
 ## Development
 

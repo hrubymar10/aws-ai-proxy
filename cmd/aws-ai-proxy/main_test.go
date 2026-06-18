@@ -205,26 +205,53 @@ func TestProfiles(t *testing.T) {
 	}
 }
 
+func TestProfileListRegionPrecedence(t *testing.T) {
+	allowed := parseAllowedProfiles("inline:eu-west-1, lookup, empty")
+	lookups := map[string]string{"inline": "us-east-1", "lookup": "ap-southeast-2"}
+	var lookedUp []string
+	got := profileList(allowed, func(profile string) string {
+		lookedUp = append(lookedUp, profile)
+		return lookups[profile]
+	})
+
+	want := []profileConfig{
+		{Name: "empty", Region: ""},
+		{Name: "inline", Region: "eu-west-1"},
+		{Name: "lookup", Region: "ap-southeast-2"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("profiles = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("profiles[%d] = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+	if strings.Join(lookedUp, ",") != "empty,lookup" {
+		t.Fatalf("lookup calls = %#v, want empty and lookup only", lookedUp)
+	}
+}
+
 func TestParseAllowedProfilesNamesOnly(t *testing.T) {
 	allowed := parseAllowedProfiles(" dev,prod ,,")
-	if _, ok := allowed["dev"]; !ok {
-		t.Fatal("dev missing")
+	if got := allowed["dev"]; got != "" {
+		t.Fatalf("dev region = %q, want empty", got)
 	}
-	if _, ok := allowed["prod"]; !ok {
-		t.Fatal("prod missing")
+	if got := allowed["prod"]; got != "" {
+		t.Fatalf("prod region = %q, want empty", got)
 	}
 	if len(allowed) != 2 {
 		t.Fatalf("allowed = %#v, want 2 entries", allowed)
 	}
 }
 
-func TestParseAllowedProfilesToleratesLegacyRegionSuffix(t *testing.T) {
-	allowed := parseAllowedProfiles("dev:us-east-1,prod:eu-west-1")
-	if _, ok := allowed["dev"]; !ok {
-		t.Fatal("dev missing")
+func TestParseAllowedProfilesKeepsRegionSuffix(t *testing.T) {
+	allowed := parseAllowedProfiles("dev:us-east-1, prod: eu-west-1 ")
+	if got := allowed["dev"]; got != "us-east-1" {
+		t.Fatalf("dev region = %q, want us-east-1", got)
 	}
-	if _, ok := allowed["prod"]; !ok {
-		t.Fatal("prod missing")
+	if got := allowed["prod"]; got != "eu-west-1" {
+		t.Fatalf("prod region = %q, want eu-west-1", got)
 	}
 	if len(allowed) != 2 {
 		t.Fatalf("allowed = %#v, want 2 entries", allowed)
@@ -480,6 +507,25 @@ func TestLoadConfigFileTreatsEmptyProfilesAsUnset(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFileTreatsEmptyOptionalAWSPathsAsUnset(t *testing.T) {
+	unsetEnv(t, envAWSCLIBinaryPath)
+	unsetEnv(t, envAWSConfigPath)
+	configPath := filepath.Join(t.TempDir(), "config")
+	data := []byte(envAWSCLIBinaryPath + "=\n" + envAWSConfigPath + "=\n")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loadConfigFile(configPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := os.LookupEnv(envAWSCLIBinaryPath); ok {
+		t.Fatalf("empty %s line should not set env", envAWSCLIBinaryPath)
+	}
+	if _, ok := os.LookupEnv(envAWSConfigPath); ok {
+		t.Fatalf("empty %s line should not set env", envAWSConfigPath)
+	}
+}
+
 func TestLoadConfigFileRejectsMalformedLine(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config")
 	if err := os.WriteFile(configPath, []byte("AWS_AI_PROXY_PROFILES dev us-east-1\n"), 0o600); err != nil {
@@ -527,7 +573,7 @@ func TestEnsureConfigFileCreatesTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, key := range []string{"AWS_AI_PROXY_PROFILES", "AWS_AI_PROXY_BIND", "AWS_AI_PROXY_ALLOW", "AWS_AI_PROXY_ACCESS_LOGS_ENABLED"} {
+	for _, key := range []string{"AWS_AI_PROXY_PROFILES", "AWS_AI_PROXY_BIND", "AWS_AI_PROXY_ALLOW", "AWS_AI_PROXY_ACCESS_LOGS_ENABLED", envAWSCLIBinaryPath, envAWSConfigPath} {
 		if !strings.Contains(text, key+"=") {
 			t.Fatalf("template missing %s line:\n%s", key, text)
 		}
@@ -573,6 +619,12 @@ func TestEnsureConfigFileAppendsOnlyMissingDefaults(t *testing.T) {
 	if !strings.Contains(text, "AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true") {
 		t.Fatalf("access log default was not appended:\n%s", text)
 	}
+	if !strings.Contains(text, envAWSCLIBinaryPath+"=") {
+		t.Fatalf("aws cli path default was not appended:\n%s", text)
+	}
+	if !strings.Contains(text, envAWSConfigPath+"=") {
+		t.Fatalf("aws config path default was not appended:\n%s", text)
+	}
 	info, err := os.Stat(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -603,10 +655,222 @@ func TestEnsureConfigFileIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestResolveAWSCLIPathUsesConfiguredExecutable(t *testing.T) {
+	t.Setenv(envAWSCLIBinaryPath, fakeExecutable(t, t.TempDir(), "aws-configured", "#!/bin/sh\n"))
+
+	got, err := resolveAWSCLIPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != os.Getenv(envAWSCLIBinaryPath) {
+		t.Fatalf("path = %q, want configured path", got)
+	}
+}
+
+func TestResolveAWSCLIPathExpandsHomeForConfiguredExecutable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	awsPath := fakeExecutable(t, filepath.Join(home, "bin"), "aws", "#!/bin/sh\n")
+	t.Setenv(envAWSCLIBinaryPath, "~/bin/aws")
+
+	got, err := resolveAWSCLIPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != awsPath {
+		t.Fatalf("path = %q, want expanded configured path %q", got, awsPath)
+	}
+}
+
+func TestResolveAWSCLIPathRejectsInvalidConfiguredPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aws")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAWSCLIBinaryPath, path)
+
+	if _, err := resolveAWSCLIPath(); err == nil || !strings.Contains(err.Error(), envAWSCLIBinaryPath) {
+		t.Fatalf("error = %v, want configured path error", err)
+	}
+}
+
+func TestResolveAWSCLIPathUsesLookPath(t *testing.T) {
+	unsetEnv(t, envAWSCLIBinaryPath)
+	dir := t.TempDir()
+	path := fakeExecutable(t, dir, "aws", "#!/bin/sh\n")
+	t.Setenv("PATH", dir)
+	withCommonAWSCLIPaths(t, nil)
+
+	got, err := resolveAWSCLIPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("path = %q, want %q", got, path)
+	}
+}
+
+func TestResolveAWSCLIPathUsesCommonPathFallback(t *testing.T) {
+	unsetEnv(t, envAWSCLIBinaryPath)
+	t.Setenv("PATH", t.TempDir())
+	path := fakeExecutable(t, t.TempDir(), "aws-common", "#!/bin/sh\n")
+	withCommonAWSCLIPaths(t, []string{filepath.Join(t.TempDir(), "missing"), path})
+
+	got, err := resolveAWSCLIPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != path {
+		t.Fatalf("path = %q, want %q", got, path)
+	}
+}
+
+func TestResolveAWSCLIPathReportsAttemptsWhenNotFound(t *testing.T) {
+	unsetEnv(t, envAWSCLIBinaryPath)
+	t.Setenv("PATH", t.TempDir())
+	missing := filepath.Join(t.TempDir(), "missing-aws")
+	withCommonAWSCLIPaths(t, []string{missing})
+
+	_, err := resolveAWSCLIPath()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "PATH:aws") || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("error = %v, want attempted paths", err)
+	}
+}
+
+func TestAWSSubprocessesUseConfiguredAWSConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	awsPath := fakeExecutable(t, dir, "aws", `#!/bin/sh
+if [ "$1" = "configure" ] && [ "$2" = "get" ]; then
+  printf "%s\n" "$AWS_CONFIG_FILE"
+  exit 0
+fi
+if [ "$1" = "configure" ] && [ "$2" = "export-credentials" ]; then
+  printf '{"config":"%s"}' "$AWS_CONFIG_FILE"
+  exit 0
+fi
+exit 9
+`)
+	configPath := filepath.Join(t.TempDir(), "aws-config")
+	t.Setenv(envAWSCLIBinaryPath, awsPath)
+	t.Setenv(envAWSConfigPath, configPath)
+
+	if got := lookupRegion("dev"); got != configPath {
+		t.Fatalf("lookupRegion = %q, want config path", got)
+	}
+	out, err := exportCredentials("dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), configPath) {
+		t.Fatalf("credentials output = %q, want config path", out)
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"~", home},
+		{"~/x", filepath.Join(home, "x")},
+		{"/abs", "/abs"},
+		{"rel", "rel"},
+		{"", ""},
+		{"~other/config", "~other/config"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := expandHome(tc.in); got != tc.want {
+				t.Fatalf("expandHome(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAWSConfigFileExpandsHomeBeforeSubprocess(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	awsPath := fakeExecutable(t, t.TempDir(), "aws", `#!/bin/sh
+printf "%s\n" "$AWS_CONFIG_FILE"
+`)
+	t.Setenv(envAWSCLIBinaryPath, awsPath)
+	t.Setenv(envAWSConfigPath, "~/.aws/config")
+
+	if got := lookupRegion("dev"); got != filepath.Join(home, ".aws", "config") {
+		t.Fatalf("lookupRegion = %q, want expanded config path", got)
+	}
+}
+
+func TestAWSConfigFileResolution(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		unsetEnv(t, envAWSConfigPath)
+		if got := awsConfigFile(); got != "" {
+			t.Fatalf("awsConfigFile = %q, want empty", got)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv(envAWSConfigPath, dir)
+		if got := awsConfigFile(); got != filepath.Join(dir, "config") {
+			t.Fatalf("awsConfigFile = %q, want dir/config", got)
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config")
+		if err := os.WriteFile(path, []byte("[default]\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(envAWSConfigPath, path)
+		if got := awsConfigFile(); got != path {
+			t.Fatalf("awsConfigFile = %q, want file path", got)
+		}
+	})
+
+	t.Run("tilde directory", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		awsDir := filepath.Join(home, ".aws")
+		if err := os.MkdirAll(awsDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(envAWSConfigPath, "~/.aws")
+		if got := awsConfigFile(); got != filepath.Join(awsDir, "config") {
+			t.Fatalf("awsConfigFile = %q, want expanded dir/config", got)
+		}
+	})
+}
+
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")
 	if err := os.Unsetenv(key); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func fakeExecutable(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func withCommonAWSCLIPaths(t *testing.T, paths []string) {
+	t.Helper()
+	orig := commonAWSCLIPaths
+	commonAWSCLIPaths = paths
+	t.Cleanup(func() { commonAWSCLIPaths = orig })
 }

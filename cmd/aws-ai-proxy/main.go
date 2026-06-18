@@ -31,9 +31,18 @@ type profileConfig struct {
 const (
 	defaultBindAddr  = "127.0.0.1:9998"
 	defaultAllowList = "127.0.0.0/8,::1/128"
+
+	envAWSCLIBinaryPath = "AWS_AI_PROXY_AWS_CLI_BINARY_PATH"
+	envAWSConfigPath    = "AWS_AI_PROXY_AWS_CONFIG_PATH"
 )
 
 var version = "dev"
+
+var commonAWSCLIPaths = []string{
+	"/opt/homebrew/bin/aws",
+	"/usr/local/bin/aws",
+	"/usr/bin/aws",
+}
 
 var configDefaults = []struct {
 	key     string
@@ -59,6 +68,16 @@ var configDefaults = []struct {
 		key:     "AWS_AI_PROXY_ACCESS_LOGS_ENABLED",
 		comment: "Access logging to ~/.aws-ai-proxy/access.log",
 		value:   "true",
+	},
+	{
+		key:     envAWSCLIBinaryPath,
+		comment: "Optional absolute path to the aws CLI binary",
+		value:   "",
+	},
+	{
+		key:     envAWSConfigPath,
+		comment: "Optional path passed to aws subprocesses as AWS_CONFIG_FILE",
+		value:   "",
 	},
 }
 
@@ -120,6 +139,10 @@ Configuration:
   AWS_AI_PROXY_ALLOW      Source IP/CIDR allowlist, default 127.0.0.0/8,::1/128
   AWS_AI_PROXY_ACCESS_LOGS_ENABLED
                           Access logging, default true; false/0/no/off disables
+  AWS_AI_PROXY_AWS_CLI_BINARY_PATH
+                          Optional absolute path to the aws CLI binary
+  AWS_AI_PROXY_AWS_CONFIG_PATH
+                          Optional path passed to aws as AWS_CONFIG_FILE
 
 If an environment variable is unset, aws-ai-proxy reads ~/.aws-ai-proxy/config
 using KEY=VALUE lines. Environment variables override file values per field.
@@ -129,6 +152,11 @@ using KEY=VALUE lines. Environment variables override file values per field.
 func serve() error {
 	if err := loadConfig(); err != nil {
 		return err
+	}
+	if closeErrorLog, err := openErrorLogger(os.Stderr); err != nil {
+		log.Printf("WARN: error logging disabled: %v", err)
+	} else {
+		defer closeErrorLog()
 	}
 
 	profilesRaw := os.Getenv("AWS_AI_PROXY_PROFILES")
@@ -312,27 +340,58 @@ func accessLogsEnabled() bool {
 }
 
 func openAccessLogger() (*log.Logger, func(), error) {
-	home, err := os.UserHomeDir()
+	path, err := appLogPath("access.log")
 	if err != nil {
 		return nil, nil, err
 	}
-	dir := filepath.Join(home, ".aws-ai-proxy")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, nil, err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, nil, err
-	}
-	path := filepath.Join(dir, "access.log")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	file, err := openLogFile(path)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = file.Close()
 		return nil, nil, err
 	}
 	return log.New(file, "", 0), func() { _ = file.Close() }, nil
+}
+
+func openErrorLogger(stderr io.Writer) (func(), error) {
+	path, err := appLogPath("error.log")
+	if err != nil {
+		return nil, err
+	}
+	file, err := openLogFile(path)
+	if err != nil {
+		return nil, err
+	}
+	log.SetOutput(io.MultiWriter(stderr, file))
+	return func() {
+		log.SetOutput(stderr)
+		_ = file.Close()
+	}, nil
+}
+
+func appLogPath(name string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".aws-ai-proxy", name), nil
+}
+
+func openLogFile(path string) (*os.File, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
 func getText(client *http.Client, url string) (string, error) {
@@ -529,7 +588,7 @@ func loadConfigFile(path string) error {
 			return fmt.Errorf("parse config %s:%d: empty key", path, lineNo+1)
 		}
 		if val == "" {
-			if key == "AWS_AI_PROXY_PROFILES" {
+			if emptyConfigValueAllowed(key) {
 				continue
 			}
 			return fmt.Errorf("parse config %s:%d: empty value for %q", path, lineNo+1, key)
@@ -543,6 +602,15 @@ func loadConfigFile(path string) error {
 	return nil
 }
 
+func emptyConfigValueAllowed(key string) bool {
+	switch key {
+	case "AWS_AI_PROXY_PROFILES", envAWSCLIBinaryPath, envAWSConfigPath:
+		return true
+	default:
+		return false
+	}
+}
+
 func parseAllowedProfiles(profilesRaw string) map[string]string {
 	allowed := make(map[string]string)
 	for _, entry := range strings.Split(profilesRaw, ",") {
@@ -550,12 +618,13 @@ func parseAllowedProfiles(profilesRaw string) map[string]string {
 		if entry == "" {
 			continue
 		}
-		name, _, _ := strings.Cut(entry, ":")
+		name, region, _ := strings.Cut(entry, ":")
 		name = strings.TrimSpace(name)
+		region = strings.TrimSpace(region)
 		if name == "" {
 			continue
 		}
-		allowed[name] = ""
+		allowed[name] = region
 	}
 	return allowed
 }
@@ -702,8 +771,8 @@ func profileList(allowed map[string]string, lookup regionLookup) []profileConfig
 	names := profileNames(allowed)
 	profiles := make([]profileConfig, 0, len(names))
 	for _, name := range names {
-		region := ""
-		if lookup != nil {
+		region := allowed[name]
+		if region == "" && lookup != nil {
 			region = lookup(name)
 		}
 		profiles = append(profiles, profileConfig{Name: name, Region: region})
@@ -712,16 +781,32 @@ func profileList(allowed map[string]string, lookup regionLookup) []profileConfig
 }
 
 func lookupRegion(profile string) string {
-	cmd := exec.Command("aws", "configure", "get", "region", "--profile", profile)
+	awsPath, err := resolveAWSCLIPath()
+	if err != nil {
+		log.Printf("WARN: region lookup for %q skipped: %v", profile, err)
+		return ""
+	}
+	cmd := exec.Command(awsPath, "configure", "get", "region", "--profile", profile)
+	withAWSConfigFile(cmd)
 	out, err := cmd.Output()
 	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+			log.Printf("WARN: region lookup for %q failed: %s", profile, strings.TrimSpace(string(exitErr.Stderr)))
+		} else {
+			log.Printf("WARN: region lookup for %q failed: %v", profile, err)
+		}
 		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
 
 func exportCredentials(profile string) ([]byte, error) {
-	cmd := exec.Command("aws", "configure", "export-credentials", "--profile", profile)
+	awsPath, err := resolveAWSCLIPath()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(awsPath, "configure", "export-credentials", "--profile", profile)
+	withAWSConfigFile(cmd)
 	out, err := cmd.Output()
 	if err == nil {
 		return out, nil
@@ -730,4 +815,73 @@ func exportCredentials(profile string) ([]byte, error) {
 		return nil, fmt.Errorf("%s", strings.TrimSpace(string(exitErr.Stderr)))
 	}
 	return nil, err
+}
+
+func resolveAWSCLIPath() (string, error) {
+	configured := strings.TrimSpace(os.Getenv(envAWSCLIBinaryPath))
+	if configured != "" {
+		configured = expandHome(configured)
+		if err := executableFile(configured); err != nil {
+			return "", fmt.Errorf("%s=%q is not executable: %w", envAWSCLIBinaryPath, configured, err)
+		}
+		return configured, nil
+	}
+
+	attempted := []string{"PATH:aws"}
+	if path, err := exec.LookPath("aws"); err == nil {
+		return path, nil
+	}
+	for _, candidate := range commonAWSCLIPaths {
+		attempted = append(attempted, candidate)
+		if executableFile(candidate) == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("aws CLI not found (attempted %s); set %s", strings.Join(attempted, ", "), envAWSCLIBinaryPath)
+}
+
+func executableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("is a directory")
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("permission denied")
+	}
+	return nil
+}
+
+func withAWSConfigFile(cmd *exec.Cmd) {
+	if path := awsConfigFile(); path != "" {
+		cmd.Env = append(os.Environ(), "AWS_CONFIG_FILE="+path)
+	}
+}
+
+func awsConfigFile() string {
+	raw := strings.TrimSpace(os.Getenv(envAWSConfigPath))
+	if raw == "" {
+		return ""
+	}
+	path := expandHome(raw)
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return filepath.Join(path, "config")
+	}
+	return path
+}
+
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~/"))
 }

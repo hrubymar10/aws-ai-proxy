@@ -18,11 +18,16 @@ not build, start, or stop this process.
 
 ## Configuration
 
-- `AWS_AI_PROXY_PROFILES` - required allowlist, comma-separated profile names
+- `AWS_AI_PROXY_PROFILES` - required allowlist, comma-separated profile names;
+  entries may use `profile:region` to set an explicit `/profiles` region
 - `AWS_AI_PROXY_BIND` - bind address, default `127.0.0.1:9998`; host must be
   an IP literal
 - `AWS_AI_PROXY_ALLOW` - source IP/CIDR allowlist, default
   `127.0.0.0/8,::1/128`
+- `AWS_AI_PROXY_AWS_CLI_BINARY_PATH` - optional absolute path to the `aws` CLI
+  binary
+- `AWS_AI_PROXY_AWS_CONFIG_PATH` - optional path passed to `aws` subprocesses as
+  `AWS_CONFIG_FILE`
 
 Configuration is env-first, with per-field fallback to
 `~/.aws-ai-proxy/config`. The config file uses `KEY=VALUE` lines with the same
@@ -33,6 +38,8 @@ AWS_AI_PROXY_BIND=127.0.0.1:9998
 AWS_AI_PROXY_ALLOW=127.0.0.0/8,::1/128
 AWS_AI_PROXY_PROFILES=dev,prod
 AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true
+AWS_AI_PROXY_AWS_CLI_BINARY_PATH=
+AWS_AI_PROXY_AWS_CONFIG_PATH=
 ```
 
 Startup auto-creates `~/.aws-ai-proxy/` as `0700` and the config file as
@@ -44,11 +51,33 @@ Access logging is enabled by default at `~/.aws-ai-proxy/access.log`. The
 access logger must be the outermost middleware so denied requests are recorded;
 never log credential response bodies or secrets.
 
+Runtime warnings and errors are written to `~/.aws-ai-proxy/error.log`.
+
+Resolve the AWS CLI in this order: `AWS_AI_PROXY_AWS_CLI_BINARY_PATH`, then
+`exec.LookPath("aws")`, then `/opt/homebrew/bin/aws`, `/usr/local/bin/aws`, and
+`/usr/bin/aws`. When `AWS_AI_PROXY_AWS_CONFIG_PATH` is set, pass it to the AWS
+CLI subprocess as `AWS_CONFIG_FILE`; it may point at the config file or an
+existing `.aws` directory, in which case append `config`. A leading `~` is
+expanded to the current user's home directory for both path-valued settings;
+`~otheruser` is not expanded.
+
+For `/profiles`, region precedence is inline `profile:region` from
+`AWS_AI_PROXY_PROFILES`, then `aws configure get region --profile <profile>`,
+then an empty string.
+
 Keep the parser dependency-free; this is an env file, not a general shell
 parser.
 
 The request allowlist is enforced from `RemoteAddr`; do not trust
 `X-Forwarded-For` for this direct-connection service.
+
+## Homebrew tap
+
+If `../homebrew-tap` exists and its `origin` targets
+`https://github.com/hrubymar10/homebrew-tap`, cross-update the `aws-ai-proxy`
+formula there for packaging-affecting changes such as release version/sha
+bumps, service definitions, or install steps. Never push without explicit
+instruction.
 
 ## Development
 
