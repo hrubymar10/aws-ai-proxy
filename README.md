@@ -42,6 +42,8 @@ export AWS_AI_PROXY_PROFILES=my-readonly,my-test-readonly
 export AWS_AI_PROXY_BIND=127.0.0.1:9998
 export AWS_AI_PROXY_ALLOW=127.0.0.0/8,::1/128
 export AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true
+export AWS_AI_PROXY_NOTIFICATIONS_ENABLED=true
+export AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW=5m
 export AWS_AI_PROXY_AWS_CLI_BINARY_PATH=/opt/homebrew/bin/aws
 export AWS_AI_PROXY_AWS_CONFIG_PATH=$HOME/.aws/config
 ```
@@ -59,6 +61,13 @@ Configuration keys:
 - `AWS_AI_PROXY_ACCESS_LOGS_ENABLED` - access logging to
   `~/.aws-ai-proxy/access.log`, default `true`. Set to `false`, `0`, `no`, or
   `off` to disable.
+- `AWS_AI_PROXY_NOTIFICATIONS_ENABLED` - OS notifications for successful
+  credential requests, default `true`. Set to `false`, `0`, `no`, or `off` to
+  disable. macOS uses `osascript`; Linux uses `notify-send` when available.
+- `AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW` - throttle repeat notifications for
+  the same client and profile, default `5m`. Accepts a Go duration (e.g. `30s`,
+  `5m`, `1h`). Set to `0` to notify on every request. Credential serving and the
+  access/`OK` logs are never throttled - only the notification is.
 - `AWS_AI_PROXY_AWS_CLI_BINARY_PATH` - optional absolute path to the `aws` CLI
   binary. When unset, `aws-ai-proxy` uses `PATH`, then common install paths:
   `/opt/homebrew/bin/aws`, `/usr/local/bin/aws`, and `/usr/bin/aws`. A leading
@@ -79,6 +88,8 @@ AWS_AI_PROXY_BIND=127.0.0.1:9998
 AWS_AI_PROXY_ALLOW=127.0.0.0/8,::1/128
 AWS_AI_PROXY_PROFILES=my-readonly,my-test-readonly
 AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true
+AWS_AI_PROXY_NOTIFICATIONS_ENABLED=true
+AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW=5m
 AWS_AI_PROXY_AWS_CLI_BINARY_PATH=
 AWS_AI_PROXY_AWS_CONFIG_PATH=
 ```
@@ -161,6 +172,20 @@ Region precedence is `profile:region` from `AWS_AI_PROXY_PROFILES`, then
 ```sh
 aws configure export-credentials --profile <profile>
 ```
+
+When notifications are enabled, a successful credential response also sends an
+OS notification. By default the notification body is `Profile "abc" was
+requested`. Callers may send `X-Aws-Ai-Proxy-Client` to identify themselves;
+then the body becomes `Profile "abc" was requested by xyz`. If that header is
+absent, the proxy falls back to `User-Agent`. The client value is trimmed,
+stripped of control characters, and capped before logging or notification.
+
+Because the AWS CLI invokes `credential_process` on nearly every API call, a
+busy client would otherwise flood Notification Center. Repeat notifications for
+the same client and profile are therefore throttled to one per
+`AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW` (default `5m`; set `0` to disable). The
+throttle applies only to the notification - credentials are always served and
+every request is still recorded in the access and `OK` logs.
 
 The proxy resolves the `aws` binary from `AWS_AI_PROXY_AWS_CLI_BINARY_PATH`,
 then `PATH`, then common install paths. When `AWS_AI_PROXY_AWS_CONFIG_PATH` is

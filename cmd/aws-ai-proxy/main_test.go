@@ -98,7 +98,7 @@ func TestAllowedProfileReturnsExportedCredentials(t *testing.T) {
 			t.Fatalf("unexpected profile %q", profile)
 		}
 		return []byte(`{"Version":1}`), nil
-	}, nil)
+	}, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
 	rec := httptest.NewRecorder()
@@ -119,7 +119,7 @@ func TestDisallowedProfileIsForbidden(t *testing.T) {
 	handler := newServer(parseAllowedProfiles("dev"), func(string) ([]byte, error) {
 		t.Fatal("exporter should not be called")
 		return nil, nil
-	}, nil)
+	}, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/credentials/prod", nil)
 	rec := httptest.NewRecorder()
@@ -133,7 +133,7 @@ func TestDisallowedProfileIsForbidden(t *testing.T) {
 func TestExporterFailureIsBadGateway(t *testing.T) {
 	handler := newServer(parseAllowedProfiles("dev"), func(string) ([]byte, error) {
 		return nil, errors.New("aws failed")
-	}, nil)
+	}, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
 	rec := httptest.NewRecorder()
@@ -144,8 +144,202 @@ func TestExporterFailureIsBadGateway(t *testing.T) {
 	}
 }
 
+func TestNotifierFiresOnSuccessfulCredentials(t *testing.T) {
+	type notice struct {
+		profile string
+		client  string
+	}
+	notices := make(chan notice, 1)
+	var logBuf bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(oldLog)
+
+	handler := newServer(parseAllowedProfiles("dev"), func(string) ([]byte, error) {
+		return []byte(`{"Version":1}`), nil
+	}, nil, func(profile, client string) {
+		notices <- notice{profile: profile, client: client}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
+	req.Header.Set(clientHeader, " codex-docker ")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	select {
+	case got := <-notices:
+		if got != (notice{profile: "dev", client: "codex-docker"}) {
+			t.Fatalf("notice = %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notifier was not called")
+	}
+	if !strings.Contains(logBuf.String(), `OK: "dev" client="codex-docker"`) {
+		t.Fatalf("log = %q, want OK line with client", logBuf.String())
+	}
+}
+
+func TestNotifierDoesNotFireOnDeniedOrFailedCredentials(t *testing.T) {
+	t.Run("denied", func(t *testing.T) {
+		notices := make(chan struct{}, 1)
+		handler := newServer(parseAllowedProfiles("dev"), func(string) ([]byte, error) {
+			t.Fatal("exporter should not be called")
+			return nil, nil
+		}, nil, func(string, string) {
+			notices <- struct{}{}
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/credentials/prod", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+		select {
+		case <-notices:
+			t.Fatal("notifier should not be called")
+		default:
+		}
+	})
+
+	t.Run("export failure", func(t *testing.T) {
+		notices := make(chan struct{}, 1)
+		handler := newServer(parseAllowedProfiles("dev"), func(string) ([]byte, error) {
+			return nil, errors.New("aws failed")
+		}, nil, func(string, string) {
+			notices <- struct{}{}
+		})
+
+		req := httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+		}
+		select {
+		case <-notices:
+			t.Fatal("notifier should not be called")
+		default:
+		}
+	})
+}
+
+func TestRequestClientPrecedenceAndSanitization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
+	req.Header.Set(clientHeader, " explicit\nclient ")
+	req.Header.Set("User-Agent", "ua")
+	if got := requestClient(req); got != "explicitclient" {
+		t.Fatalf("explicit client = %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
+	req.Header.Set("User-Agent", " user-agent ")
+	if got := requestClient(req); got != "user-agent" {
+		t.Fatalf("user-agent client = %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/credentials/dev", nil)
+	if got := requestClient(req); got != "" {
+		t.Fatalf("empty client = %q", got)
+	}
+}
+
+func TestSanitizeNotifyValueCapsRunesAndDropsControlChars(t *testing.T) {
+	long := strings.Repeat("å", maxNotifyValueRunes+5)
+	got := sanitizeNotifyValue(" \n" + long + "\t ")
+	if len([]rune(got)) != maxNotifyValueRunes {
+		t.Fatalf("sanitized rune count = %d, want %d", len([]rune(got)), maxNotifyValueRunes)
+	}
+	if strings.ContainsAny(got, "\n\t") {
+		t.Fatalf("sanitized value still contains control chars: %q", got)
+	}
+}
+
+func TestNotifyDeduperThrottlesPerClientAndProfile(t *testing.T) {
+	d := newNotifyDeduper(5 * time.Minute)
+	base := time.Unix(1_700_000_000, 0)
+	now := base
+	d.now = func() time.Time { return now }
+
+	if !d.allow("claude-docker", "dev") {
+		t.Fatal("first notification should be allowed")
+	}
+	if d.allow("claude-docker", "dev") {
+		t.Fatal("repeat within window should be suppressed")
+	}
+
+	// A different profile for the same client is an independent event.
+	if !d.allow("claude-docker", "prod") {
+		t.Fatal("different profile should be allowed")
+	}
+	// A different client is independent too.
+	if !d.allow("codex-docker", "dev") {
+		t.Fatal("different client should be allowed")
+	}
+
+	// Just before the window elapses: still suppressed.
+	now = base.Add(5*time.Minute - time.Nanosecond)
+	if d.allow("claude-docker", "dev") {
+		t.Fatal("still within window should be suppressed")
+	}
+	// After the window: allowed again.
+	now = base.Add(5 * time.Minute)
+	if !d.allow("claude-docker", "dev") {
+		t.Fatal("after window should be allowed again")
+	}
+}
+
+func TestNotifyDeduperDisabledWhenWindowNonPositive(t *testing.T) {
+	for _, w := range []time.Duration{0, -time.Minute} {
+		d := newNotifyDeduper(w)
+		for i := range 5 {
+			if !d.allow("claude-docker", "dev") {
+				t.Fatalf("window %s should disable dedup (call %d suppressed)", w, i)
+			}
+		}
+	}
+}
+
+func TestNotificationDedupWindowConfig(t *testing.T) {
+	t.Run("default when unset", func(t *testing.T) {
+		unsetEnv(t, envNotificationDedupWindow)
+		if got := notificationDedupWindow(); got != defaultNotificationDedupWindow {
+			t.Fatalf("default = %s, want %s", got, defaultNotificationDedupWindow)
+		}
+	})
+	t.Run("valid duration honored", func(t *testing.T) {
+		t.Setenv(envNotificationDedupWindow, "90s")
+		if got := notificationDedupWindow(); got != 90*time.Second {
+			t.Fatalf("got %s, want 90s", got)
+		}
+	})
+	t.Run("zero disables", func(t *testing.T) {
+		t.Setenv(envNotificationDedupWindow, "0")
+		if got := notificationDedupWindow(); got != 0 {
+			t.Fatalf("got %s, want 0", got)
+		}
+	})
+	t.Run("negative treated as disabled", func(t *testing.T) {
+		t.Setenv(envNotificationDedupWindow, "-5m")
+		if got := notificationDedupWindow(); got != 0 {
+			t.Fatalf("got %s, want 0", got)
+		}
+	})
+	t.Run("invalid falls back to default", func(t *testing.T) {
+		t.Setenv(envNotificationDedupWindow, "not-a-duration")
+		if got := notificationDedupWindow(); got != defaultNotificationDedupWindow {
+			t.Fatalf("got %s, want %s", got, defaultNotificationDedupWindow)
+		}
+	})
+}
+
 func TestHealth(t *testing.T) {
-	handler := newServer(parseAllowedProfiles("dev"), nil, nil)
+	handler := newServer(parseAllowedProfiles("dev"), nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -159,7 +353,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	handler := newServer(parseAllowedProfiles("dev"), nil, nil)
+	handler := newServer(parseAllowedProfiles("dev"), nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/version", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -176,7 +370,7 @@ func TestProfiles(t *testing.T) {
 	regions := map[string]string{"dev": "us-east-1", "prod": ""}
 	handler := newServer(parseAllowedProfiles("prod, dev"), nil, func(profile string) string {
 		return regions[profile]
-	})
+	}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/profiles", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -431,6 +625,80 @@ func TestAccessLogsEnabledDefaultAndFalsey(t *testing.T) {
 	}
 }
 
+func TestNotificationsEnabledDefaultAndFalsey(t *testing.T) {
+	unsetEnv(t, envNotifications)
+	if !notificationsEnabled() {
+		t.Fatal("notifications should be enabled by default")
+	}
+	for _, val := range []string{"false", "FALSE", "0", "no", "off", " Off "} {
+		t.Run(val, func(t *testing.T) {
+			t.Setenv(envNotifications, val)
+			if notificationsEnabled() {
+				t.Fatalf("%q should disable notifications", val)
+			}
+		})
+	}
+}
+
+func TestNotificationCommand(t *testing.T) {
+	t.Run("darwin", func(t *testing.T) {
+		name, args, err := notificationCommandWithLookPath("darwin", "dev", "codex", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name != "osascript" {
+			t.Fatalf("name = %q, want osascript", name)
+		}
+		if len(args) != 2 || args[0] != "-e" {
+			t.Fatalf("args = %#v, want osascript expression", args)
+		}
+		want := `display notification "Profile \"dev\" was requested by codex" with title "aws-ai-proxy"`
+		if args[1] != want {
+			t.Fatalf("osascript expression = %q, want %q", args[1], want)
+		}
+	})
+
+	t.Run("linux", func(t *testing.T) {
+		name, args, err := notificationCommandWithLookPath("linux", "dev", "codex", func(binary string) (string, error) {
+			if binary != "notify-send" {
+				t.Fatalf("lookPath binary = %q", binary)
+			}
+			return "/usr/bin/notify-send", nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name != "/usr/bin/notify-send" {
+			t.Fatalf("name = %q, want notify-send path", name)
+		}
+		want := []string{notificationTitle, `Profile "dev" was requested by codex`}
+		if len(args) != len(want) {
+			t.Fatalf("args = %#v, want %#v", args, want)
+		}
+		for i := range want {
+			if args[i] != want[i] {
+				t.Fatalf("args[%d] = %q, want %q", i, args[i], want[i])
+			}
+		}
+	})
+
+	t.Run("linux missing", func(t *testing.T) {
+		_, _, err := notificationCommandWithLookPath("linux", "dev", "", func(string) (string, error) {
+			return "", errors.New("missing")
+		})
+		if err == nil || !strings.Contains(err.Error(), "notify-send not found") {
+			t.Fatalf("error = %v, want notify-send not found", err)
+		}
+	})
+
+	t.Run("unsupported", func(t *testing.T) {
+		_, _, err := notificationCommandWithLookPath("windows", "dev", "", nil)
+		if err == nil || !strings.Contains(err.Error(), "unsupported OS") {
+			t.Fatalf("error = %v, want unsupported OS", err)
+		}
+	})
+}
+
 func TestLoadConfigFileMissingIsNoop(t *testing.T) {
 	if err := loadConfigFile(filepath.Join(t.TempDir(), "missing.yaml")); err != nil {
 		t.Fatal(err)
@@ -573,7 +841,7 @@ func TestEnsureConfigFileCreatesTemplate(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	for _, key := range []string{"AWS_AI_PROXY_PROFILES", "AWS_AI_PROXY_BIND", "AWS_AI_PROXY_ALLOW", "AWS_AI_PROXY_ACCESS_LOGS_ENABLED", envAWSCLIBinaryPath, envAWSConfigPath} {
+	for _, key := range []string{"AWS_AI_PROXY_PROFILES", "AWS_AI_PROXY_BIND", "AWS_AI_PROXY_ALLOW", "AWS_AI_PROXY_ACCESS_LOGS_ENABLED", envNotifications, envAWSCLIBinaryPath, envAWSConfigPath} {
 		if !strings.Contains(text, key+"=") {
 			t.Fatalf("template missing %s line:\n%s", key, text)
 		}
@@ -618,6 +886,9 @@ func TestEnsureConfigFileAppendsOnlyMissingDefaults(t *testing.T) {
 	}
 	if !strings.Contains(text, "AWS_AI_PROXY_ACCESS_LOGS_ENABLED=true") {
 		t.Fatalf("access log default was not appended:\n%s", text)
+	}
+	if !strings.Contains(text, envNotifications+"=true") {
+		t.Fatalf("notification default was not appended:\n%s", text)
 	}
 	if !strings.Contains(text, envAWSCLIBinaryPath+"=") {
 		t.Fatalf("aws cli path default was not appended:\n%s", text)

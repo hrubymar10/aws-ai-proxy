@@ -13,15 +13,19 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 type credentialExporter func(profile string) ([]byte, error)
 type regionLookup func(profile string) string
+type notifier func(profile, client string)
 
 type profileConfig struct {
 	Name   string `json:"name"`
@@ -32,11 +36,20 @@ const (
 	defaultBindAddr  = "127.0.0.1:9998"
 	defaultAllowList = "127.0.0.0/8,::1/128"
 
-	envAWSCLIBinaryPath = "AWS_AI_PROXY_AWS_CLI_BINARY_PATH"
-	envAWSConfigPath    = "AWS_AI_PROXY_AWS_CONFIG_PATH"
+	envAWSCLIBinaryPath        = "AWS_AI_PROXY_AWS_CLI_BINARY_PATH"
+	envAWSConfigPath           = "AWS_AI_PROXY_AWS_CONFIG_PATH"
+	envNotifications           = "AWS_AI_PROXY_NOTIFICATIONS_ENABLED"
+	envNotificationDedupWindow = "AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW"
+	clientHeader               = "X-Aws-Ai-Proxy-Client"
+	notificationTitle          = "aws-ai-proxy"
+	maxNotifyValueRunes        = 64
+	notificationTimeout        = 5 * time.Second
+
+	defaultNotificationDedupWindow = 5 * time.Minute
 )
 
 var version = "dev"
+var notificationWarnOnce sync.Once
 
 var commonAWSCLIPaths = []string{
 	"/opt/homebrew/bin/aws",
@@ -68,6 +81,16 @@ var configDefaults = []struct {
 		key:     "AWS_AI_PROXY_ACCESS_LOGS_ENABLED",
 		comment: "Access logging to ~/.aws-ai-proxy/access.log",
 		value:   "true",
+	},
+	{
+		key:     envNotifications,
+		comment: "OS notifications for successful credential requests",
+		value:   "true",
+	},
+	{
+		key:     envNotificationDedupWindow,
+		comment: "Per-client+profile notification throttle window (Go duration; 0 disables)",
+		value:   "5m",
 	},
 	{
 		key:     envAWSCLIBinaryPath,
@@ -139,6 +162,11 @@ Configuration:
   AWS_AI_PROXY_ALLOW      Source IP/CIDR allowlist, default 127.0.0.0/8,::1/128
   AWS_AI_PROXY_ACCESS_LOGS_ENABLED
                           Access logging, default true; false/0/no/off disables
+  AWS_AI_PROXY_NOTIFICATIONS_ENABLED
+                          OS notifications, default true; false/0/no/off disables
+  AWS_AI_PROXY_NOTIFICATION_DEDUP_WINDOW
+                          Throttle repeat notifications per client+profile
+                          (Go duration, default 5m; 0 disables throttling)
   AWS_AI_PROXY_AWS_CLI_BINARY_PATH
                           Optional absolute path to the aws CLI binary
   AWS_AI_PROXY_AWS_CONFIG_PATH
@@ -200,7 +228,20 @@ func serve() error {
 		defer os.Remove(pidPath)
 	}
 
-	handler := allowMiddleware(newServer(allowed, exportCredentials, lookupRegion), allow)
+	var notify notifier
+	if notificationsEnabled() {
+		window := notificationDedupWindow()
+		if window > 0 {
+			log.Printf("notifications throttled to one per client+profile every %s", window)
+		}
+		deduper := newNotifyDeduper(window)
+		notify = func(profile, client string) {
+			if deduper.allow(client, profile) {
+				osNotify(profile, client)
+			}
+		}
+	}
+	handler := allowMiddleware(newServer(allowed, exportCredentials, lookupRegion, notify), allow)
 	if accessLogsEnabled() {
 		if accessLogger, closeLog, err := openAccessLogger(); err != nil {
 			log.Printf("WARN: access logging disabled: %v", err)
@@ -337,6 +378,77 @@ func accessLogsEnabled() bool {
 	default:
 		return true
 	}
+}
+
+func notificationsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envNotifications))) {
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// notificationDedupWindow returns the per-client+profile notification throttle
+// window. Unset/empty -> default; a valid Go duration is honored (<=0 disables
+// dedup, notifying on every request); an invalid value warns and falls back to
+// the default.
+func notificationDedupWindow() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(envNotificationDedupWindow))
+	if raw == "" {
+		return defaultNotificationDedupWindow
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("WARN: invalid %s=%q, using %s: %v", envNotificationDedupWindow, raw, defaultNotificationDedupWindow, err)
+		return defaultNotificationDedupWindow
+	}
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// notifyDeduper suppresses repeat notifications for the same client+profile
+// within a window. It is safe for concurrent use; notifications fire from
+// goroutines.
+type notifyDeduper struct {
+	mu     sync.Mutex
+	last   map[string]time.Time
+	window time.Duration
+	now    func() time.Time
+}
+
+func newNotifyDeduper(window time.Duration) *notifyDeduper {
+	return &notifyDeduper{
+		last:   make(map[string]time.Time),
+		window: window,
+		now:    time.Now,
+	}
+}
+
+// allow reports whether a notification for client+profile should fire now. A
+// non-positive window disables dedup (always allows).
+func (d *notifyDeduper) allow(client, profile string) bool {
+	if d.window <= 0 {
+		return true
+	}
+	key := client + "\x00" + profile
+	now := d.now()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// Opportunistic prune so the map does not grow with one-off clients.
+	for k, t := range d.last {
+		if now.Sub(t) >= d.window {
+			delete(d.last, k)
+		}
+	}
+	if t, ok := d.last[key]; ok && now.Sub(t) < d.window {
+		return false
+	}
+	d.last[key] = now
+	return true
 }
 
 func openAccessLogger() (*log.Logger, func(), error) {
@@ -715,7 +827,7 @@ func allowMiddleware(next http.Handler, allow []netip.Prefix) http.Handler {
 	})
 }
 
-func newServer(allowed map[string]string, exporter credentialExporter, lookup regionLookup) http.Handler {
+func newServer(allowed map[string]string, exporter credentialExporter, lookup regionLookup, notify notifier) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /credentials/{profile}", func(w http.ResponseWriter, r *http.Request) {
@@ -735,7 +847,11 @@ func newServer(allowed map[string]string, exporter credentialExporter, lookup re
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
-		log.Printf("OK: %q", profile)
+		client := requestClient(r)
+		log.Printf("OK: %q client=%q", profile, client)
+		if notify != nil {
+			go notify(profile, client)
+		}
 	})
 
 	mux.HandleFunc("GET /profiles", func(w http.ResponseWriter, _ *http.Request) {
@@ -756,6 +872,82 @@ func newServer(allowed map[string]string, exporter credentialExporter, lookup re
 	})
 
 	return mux
+}
+
+func requestClient(r *http.Request) string {
+	if client := sanitizeNotifyValue(r.Header.Get(clientHeader)); client != "" {
+		return client
+	}
+	return sanitizeNotifyValue(r.UserAgent())
+}
+
+func sanitizeNotifyValue(value string) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	value = strings.TrimSpace(b.String())
+	if value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) > maxNotifyValueRunes {
+		value = string(runes[:maxNotifyValueRunes])
+	}
+	return value
+}
+
+func osNotify(profile, client string) {
+	name, args, err := notificationCommand(runtime.GOOS, profile, client)
+	if err != nil {
+		notificationWarnOnce.Do(func() {
+			log.Printf("WARN: OS notifications disabled: %v", err)
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), notificationTimeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, name, args...).Run(); err != nil {
+		notificationWarnOnce.Do(func() {
+			log.Printf("WARN: OS notifications disabled: %v", err)
+		})
+	}
+}
+
+func notificationCommand(goos, profile, client string) (string, []string, error) {
+	return notificationCommandWithLookPath(goos, profile, client, exec.LookPath)
+}
+
+func notificationCommandWithLookPath(goos, profile, client string, lookPath func(string) (string, error)) (string, []string, error) {
+	body := notificationBody(sanitizeNotifyValue(profile), sanitizeNotifyValue(client))
+	switch goos {
+	case "darwin":
+		return "osascript", []string{"-e", fmt.Sprintf(`display notification "%s" with title "%s"`, escapeAppleScript(body), escapeAppleScript(notificationTitle))}, nil
+	case "linux":
+		path, err := lookPath("notify-send")
+		if err != nil {
+			return "", nil, fmt.Errorf("notify-send not found: %w", err)
+		}
+		return path, []string{notificationTitle, body}, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported OS %q", goos)
+	}
+}
+
+func notificationBody(profile, client string) string {
+	if client != "" {
+		return fmt.Sprintf("Profile %q was requested by %s", profile, client)
+	}
+	return fmt.Sprintf("Profile %q was requested", profile)
+}
+
+func escapeAppleScript(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return strings.ReplaceAll(value, `"`, `\"`)
 }
 
 func profileNames(allowed map[string]string) []string {
